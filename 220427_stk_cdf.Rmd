@@ -1,0 +1,295 @@
+---
+title: "smg_ttk_bootstrap"
+author: "hubris"
+date: "2/19/2022"
+output:
+  rmdformats::downcute:
+      self_contained: true
+      highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up
+
+## Load libraries
+```{r}
+library(tidyverse)
+library(gridExtra)
+```
+
+
+## Load stats matrix
+
+```{r}
+dams <- read_csv('220429_ar_stats.csv')
+
+DT::datatable(dams)
+
+# Load shot ratio table
+shot_ratios <- read_csv('shot_ratios.csv')
+
+DT::datatable(shot_ratios)
+
+# Miss ratio
+misses <- 0
+hp <- 300
+
+# Bound shots
+dam_range <- range(dams[,grep(colnames(dams), pattern = '^damage.*')])
+shots_bounds <- c(ceiling(hp/dam_range[2])-1, ceiling(hp/dam_range[1])+1)
+```
+
+# Write multinom function
+
+```{r}
+multinom_gun_sim <- function(X,
+                             n_samples = 10000,
+                             shot_probs = c(0.25,0.75),
+                             damage = c(50, 40),
+                             health = 300,
+                             miss = 0){
+  if(length(shot_probs) != length(damage) | miss < 0 | miss > 1){
+    print('you fucked up there partner')
+  }else{
+   multinom_results <- rmultinom(n = n_samples,
+                              size = X,
+                              prob = c(shot_probs*(1-miss), miss))
+   
+   multinom_damages <- multinom_results*c(damage, 0)
+   
+   cdf_estimate = sum(colSums(multinom_damages) >= health)/n_samples
+   
+   return(tibble(n_bullets = X,
+                 cdf_estimate = cdf_estimate))
+  }
+}
+
+
+multinom_gun_sim(X = 2, health = 100)
+
+test_sweep <- sapply(X = 1:5,
+                FUN = multinom_gun_sim,
+                health = 100,
+                damage = c(30,20),
+                shot_probs = c(.25,.75))
+
+print(test_sweep)
+
+```
+
+# Apply multinom distribution to actual data
+
+```{r}
+start <- Sys.time()
+
+for(i in 1:nrow(dams)){
+  print(paste0('Estimating TTK CDF for: ', dams$gun[i]))
+  print(paste0('Using damage profile at: ', dams$distance[i], ' meters'))
+  
+  sim_results <- sapply(X = min(shots_bounds):max(shots_bounds),
+                         FUN = multinom_gun_sim,
+                         health = hp,
+                         damage = unlist(dams[i, grep(x = colnames(dams), pattern = '^damage.')]),
+                         shot_probs = shot_ratios$chance,
+                        miss = misses)
+  
+  curr_results <- tibble(n_bullets = unlist(t(sim_results)[,1]),
+                        cdf_est = unlist(t(sim_results)[,2]),
+                        gun = dams$gun[i],
+                        vintage = dams$vintage[i],
+                        fire_rate = dams$fire_rate[i],
+                        distance = dams$distance[i],
+                        exp_dam = sum(shot_ratios$chance*unlist(dams[i, grep(x = colnames(dams), pattern = '^damage.')]))*(1-misses),
+                        exp_btk = hp/exp_dam)
+  
+  if(i == 1){
+    results <- curr_results
+  }else{
+    results <- rbind(results, curr_results)
+  }
+}
+end <- Sys.time()
+
+print(paste0('Elapsed time: ', end - start))
+
+results <- results %>%
+  mutate(ttk = (n_bullets-1)*60/fire_rate) %>%
+  mutate(exp_ttk = (exp_btk-1)*60/fire_rate) %>%
+  mutate(exp_ttkr = (ceiling(exp_btk)-1)*60/fire_rate)
+
+ggplot(results, aes(x = n_bullets, y = cdf_est, color = gun))+
+  geom_point(size = 5)+
+  geom_line(size = 2)+
+  theme_bw()+
+  facet_wrap(~distance)
+
+ggplot(results, aes(x = ttk, y = cdf_est, color = gun))+
+  geom_point(size = 5)+
+  geom_line(size = 2)+
+  theme_bw()+
+  facet_wrap(~distance)
+```
+
+# Recover pdf from cdf
+
+```{r}
+results2 <- results %>%
+  group_by(gun, distance) %>%
+  arrange(n_bullets) %>%
+  mutate(probability = cdf_est - lag(cdf_est,
+                                     default = cdf_est[1]))
+
+results2_dynamic <- results2 %>%
+  filter(probability > 0.01 & probability < 0.99)
+
+ggplot(results2, aes(x = ttk, y = probability, fill = gun))+
+  geom_col(width = 60/max(results2$fire_rate))+
+  facet_grid(gun~distance, scales = 'free_x')+
+  theme_bw()+
+  xlim(c(min(results2_dynamic$ttk) - 0.1, max(results2_dynamic$ttk) + 0.1))
+
+ggplot(results2, aes(x = ttk, y = probability, color = gun))+
+  geom_point(size = 5)+
+  geom_line(size = 2)+
+  facet_wrap(~distance)+
+  theme_bw()+
+  xlim(c(min(results2_dynamic$ttk) - 0.5, max(results2_dynamic$ttk) + 0.5))
+
+
+
+```
+
+# Damage per mag
+
+```{r}
+
+multinom_mag_sim <- function(X,
+                             n_samples = 1000,
+                             shot_probs = c(0.25,0.75),
+                             damage = c(50, 40),
+                             miss = 0){
+  if(length(shot_probs) != length(damage) | miss < 0 | miss > 1){
+    print('you fucked up there partner')
+  }else{
+   multinom_results <- rmultinom(n = n_samples,
+                              size = X,
+                              prob = c(shot_probs*(1-miss), miss))
+   
+   multinom_damages <- multinom_results*c(damage, 0)
+   
+   return(colSums(multinom_damages))
+  }
+}
+
+for(i in 1:nrow(dams)){
+  print(paste0('Estimating effective damage per mag for: ', dams$gun[i]))
+  
+  sim_results <- sapply(X = dams$mag_size[i],
+                         FUN = multinom_mag_sim,
+                         damage = unlist(dams[i, grep(x = colnames(dams), pattern = '^damage.')]),
+                         shot_probs = shot_ratios$chance,
+                        miss = misses)
+  
+  curr_dpm_results <- tibble(iter = 1:nrow(sim_results),
+                         damage_per_mag = sim_results,
+                        gun = dams$gun[i],
+                        vintage = dams$vintage[i],
+                        fire_rate = dams$fire_rate[i],
+                        distance = dams$distance[i],
+                        reload_add_time = dams$reload_add_time[i],
+                        mag_size = dams$mag_size[i])
+  
+  if(i == 1){
+    dpm_results <- curr_dpm_results
+  }else{
+    dpm_results <- rbind(dpm_results, curr_dpm_results)
+  }
+}
+
+
+dpm_results <- dpm_results %>%
+  mutate(dist_char = paste0(dpm_results$distance, '_meters')) %>%
+  mutate(mag_duration = mag_size/(fire_rate/60)) %>%
+  mutate(eDPS = damage_per_mag[,1]/(mag_duration + reload_add_time)) %>%
+  mutate(DPS = damage_per_mag[,1]/(mag_duration))
+
+
+p1 <- ggplot(dpm_results, aes(x = damage_per_mag[,1], fill = gun))+
+  geom_density(alpha = 0.75)+
+  theme_bw()+
+  xlab('Effective damage per mag')+
+  ggtitle(paste0(misses, ' miss'))+
+  facet_wrap(~dist_char)
+
+p2 <- ggplot(dpm_results, aes(x = damage_per_mag[,1]/300, fill = gun))+
+  geom_density(alpha = 0.75)+
+  theme_bw()+
+  xlab('Downs per mag \n (300 hp)')+
+  ggtitle(paste0(misses, ' miss'))+
+  facet_wrap(~dist_char)
+
+grid.arrange(p1, p2, ncol = 1)
+  
+p3 <- ggplot(dpm_results, aes(x = damage_per_mag[,1], y = eDPS, color = gun))+
+  geom_density_2d()+
+  stat_summary(geom = 'point',
+               fun.y = 'mean',
+               fun.x = 'mean')+
+  facet_wrap(~distance)+
+  theme_bw()+
+  xlab('Effective Damage per mag')
+
+p4 <- ggplot(dpm_results, aes(x = damage_per_mag[,1]/300, y = eDPS, color = gun))+
+  geom_density_2d()+
+  facet_wrap(~distance)+
+  theme_bw()+
+  xlab('Downs per mag \n (300 hp)')
+
+grid.arrange(p3, p4, ncol = 1)
+
+p5 <- ggplot(dpm_results, aes(x = DPS, y = eDPS, color = gun))+
+  geom_density_2d()+
+  facet_wrap(~distance)+
+  theme_bw()+
+  coord_equal()+
+  geom_abline(slope = 1, linetype = 'dashed')
+
+dpm_results_summary <- dpm_results %>%
+  group_by(gun, distance) %>%
+  summarize(mean_DPM = mean(damage_per_mag),
+            mean_DPS = mean(DPS),
+            mean_eDPS = mean(eDPS))
+```
+
+# create stat summary table
+
+```{r}
+summary_tibble <- dams %>%
+  mutate(mag_duration = mag_size/(fire_rate/60))
+
+summary_tibble <- full_join(x = summary_tibble,
+                           y = dpm_results_summary,
+                           by = c('gun', 'distance')) %>%
+  mutate(row_id = paste0(gun, '_', distance, 'm'))
+
+
+
+summary_df <- data.frame(summary_tibble %>% dplyr::select(-gun, -vintage, -row_id, -distance),
+                         row.names = summary_tibble$row_id)
+
+row_anno <- data.frame(vintage = summary_tibble$vintage,
+                       distance = summary_tibble$distance,
+                       row.names = summary_tibble$row_id)
+
+pheatmap::pheatmap(summary_df[,-3],
+                   display_numbers = round(summary_df[,-3],2),
+                   scale = 'column',
+                   cluster_rows = TRUE,
+                   cluster_cols = TRUE,
+                   main = 'column z-scored',
+                   annotation_row = row_anno)
+```
+
